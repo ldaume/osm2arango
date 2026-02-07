@@ -1,0 +1,27 @@
+{
+  "name": "osm2arango",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Progressive OpenStreetMap import tool for ArangoDB (Bun + TypeScript).",
+  "license": "MIT",
+  "bin": {
+    "osm2arango": "bin/osm2arango"
+  },
+  "scripts": {
+    "test": "bun test",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "bun build src/cli.ts --outdir dist --target bun"
+  },
+  "dependencies": {
+    "arangojs": "^10.2.2"
+  },
+  "devDependencies": {
+    "@antfu/eslint-config": "^7.3.0",
+    "bun-types": "^1.3.8",
+    "eslint": "^10.0.0",
+    "eslint-plugin-format": "^1.4.0",
+    "typescript": "^5.9.3"
+  }
+}
