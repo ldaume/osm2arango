@@ -1,6 +1,6 @@
 services:
   arangodb:
-    image: arangodb/arangodb:3.12
+    image: arangodb/arangodb:3.12.4.3
     environment:
       ARANGO_ROOT_PASSWORD: changeme
     ports:
