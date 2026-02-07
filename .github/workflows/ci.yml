@@ -14,5 +14,32 @@ jobs:
           bun-version: latest
       - run: bun install
       - run: bun run typecheck
-      - run: bun test --coverage
+      - name: Test (coverage)
+        run: |
+          set -o pipefail
+          bun test --coverage --coverage-reporter=text 2>&1 | tee bun-test.log
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage'
+            echo ''
+            echo '```text'
+            if [ -f bun-test.log ]; then
+              awk '
+                index($0, "|---------|---------|") {
+                  if (!started) started = 1
+                  dashes++
+                }
+                started {
+                  print
+                  if (dashes >= 3 && index($0, "|---------|---------|"))
+                    exit
+                }
+              ' bun-test.log || true
+            else
+              echo 'No coverage output found.'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - run: bun run lint
