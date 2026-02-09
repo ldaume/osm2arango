@@ -90,6 +90,58 @@ describe('osmiumGeoJsonFeatureToDoc()', () => {
     expect(doc.tags.amenity).toBe('bar')
   })
 
+  test('stringifies non-string tag values when present', () => {
+    // Given
+    const feature = {
+      type: 'Feature',
+      id: 'n1',
+      properties: {
+        type: 'node',
+        id: 1,
+        height: 7,
+        wheelchair: false,
+      },
+      geometry: { type: 'Point', coordinates: [0, 0] },
+    }
+
+    // When
+    const doc = osmiumGeoJsonFeatureToDoc(feature)
+
+    // Then
+    expect(doc.tags.height).toBe('7')
+    expect(doc.tags.wheelchair).toBe('false')
+  })
+
+  test('stores @attributes in `osm` and does not treat them as tags', () => {
+    // Given
+    const feature = {
+      type: 'Feature',
+      id: 'n1',
+      properties: {
+        '@type': 'node',
+        '@id': 1,
+        '@timestamp': 1700000000,
+        'amenity': 'cafe',
+        'name': 'Cafe X',
+      },
+      geometry: { type: 'Point', coordinates: [0, 0] },
+    }
+
+    // When
+    const doc = osmiumGeoJsonFeatureToDoc(feature)
+
+    // Then
+    expect(doc.osm.type).toBe('node')
+    expect(doc.osm.id).toBe(1)
+    expect(doc.osm.timestamp).toBe(1700000000)
+    expect(doc.tags.amenity).toBe('cafe')
+    expect(doc.tags.name).toBe('Cafe X')
+    expect(doc.tags['@type']).toBeUndefined()
+    expect(doc.tags['@id']).toBeUndefined()
+    expect(doc.tags['@timestamp']).toBeUndefined()
+    expect(doc.tagsKV.some(v => v.startsWith('@'))).toBe(false)
+  })
+
   test('throws if geometry.type is missing', () => {
     // Given
     const feature = {
@@ -120,10 +172,44 @@ describe('buildOsmiumExportArgs()', () => {
       'geojsonseq',
       '-x',
       'print_record_separator=false',
-      '-x',
-      'tags_type=array',
       '--add-unique-id=type_id',
       '--attributes=type,id,version,changeset,timestamp,uid,user',
     ])
+  })
+
+  test('can include --index-type when configured', () => {
+    // Given
+    const inputPath = 'data/berlin-latest.osm.pbf'
+
+    // When
+    const args = buildOsmiumExportArgs(inputPath, { indexType: 'sparse_file_array,/tmp/osmium.idx' })
+
+    // Then
+    expect(args).toContain('--index-type')
+    expect(args).toContain('sparse_file_array,/tmp/osmium.idx')
+  })
+
+  test('can include --geometry-types when configured', () => {
+    // Given
+    const inputPath = 'data/berlin-latest.osm.pbf'
+
+    // When
+    const args = buildOsmiumExportArgs(inputPath, { geometryTypes: 'point,polygon' })
+
+    // Then
+    expect(args).toContain('--geometry-types')
+    expect(args).toContain('point,polygon')
+  })
+
+  test('can include --config when configured', () => {
+    // Given
+    const inputPath = 'data/berlin-latest.osm.pbf'
+
+    // When
+    const args = buildOsmiumExportArgs(inputPath, { configPath: '/tmp/osmium-export.json' })
+
+    // Then
+    expect(args).toContain('--config')
+    expect(args).toContain('/tmp/osmium-export.json')
   })
 })

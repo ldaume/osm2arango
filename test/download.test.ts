@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, test } from 'bun:test'
@@ -28,6 +28,7 @@ describe('downloadGeofabrikExtract()', () => {
       expect(result.url).toBe(`${baseUrl}/europe/germany/berlin-latest.osm.pbf`)
       expect(result.path).toBe(`${outDir}/berlin-latest.osm.pbf`)
       expect(await Bun.file(result.path).text()).toBe('pbf-bytes')
+      expect(await readdir(outDir)).toEqual(['berlin-latest.osm.pbf'])
     }
     finally {
       await rm(outDir, { recursive: true, force: true })

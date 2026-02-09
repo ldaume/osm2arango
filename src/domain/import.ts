@@ -1,7 +1,10 @@
 import type { ArangoConnectionConfig } from '../config.ts'
 import type { OsmFeatureDoc } from '../osm/feature.ts'
+import type { ImportProfile } from '../osm/import-profile.ts'
+
 import { createArangoClient as createArangoClientLive } from '../arango/arango.data.ts'
 import { isArangoSupportedGeoJsonGeometryType } from '../osm/geojson.ts'
+import { shouldImportFeatureForProfile } from '../osm/import-profile.ts'
 import { osmiumGeoJsonFeatureToDoc, spawnOsmiumExport } from '../osm/osmium.ts'
 import { createDocumentChunker } from '../util/document-chunker.ts'
 import { readLines } from '../util/lines.ts'
@@ -15,6 +18,7 @@ export type ImportPhase = 'reading' | 'importing' | 'finalizing' | 'done'
 export interface ImportProgress {
   phase: ImportPhase
   adapter: ImportAdapter
+  profile: ImportProfile
   seen: number
   created: number
   updated: number
@@ -22,6 +26,9 @@ export interface ImportProgress {
   empty: number
   errors: number
   skippedUnsupportedGeometry: number
+  skippedByProfile: number
+  skippedTooLongLines: number
+  skippedInvalidJsonLines: number
   inFlight: number
   unsupportedGeometryMode: UnsupportedGeometryMode
 }
@@ -40,9 +47,17 @@ export interface ImportOptions {
   concurrency: number
   onDuplicate: 'error' | 'update' | 'replace' | 'ignore'
   unsupportedGeometry?: UnsupportedGeometryMode
+  maxLineBytes?: number
+  importTransport?: 'arangojs' | 'node-http' | 'curl'
+  dryRun?: boolean
+  invalidJson?: 'error' | 'skip'
+  osmiumIndexType?: string
+  osmiumGeometryTypes?: string
+  profile?: ImportProfile
 }
 
 export interface ImportSummary {
+  profile: ImportProfile
   seen: number
   created: number
   updated: number
@@ -50,6 +65,11 @@ export interface ImportSummary {
   empty: number
   errors: number
   skippedUnsupportedGeometry: number
+  skippedByProfile: number
+  skippedTooLongLines: number
+  skippedInvalidJsonLines: number
+  maxInvalidJsonLineBytes: number
+  maxTooLongLineBytes: number
   unsupportedGeometryMode: UnsupportedGeometryMode
   geometryTypeCounts: Record<string, number>
   unsupportedGeometryTypeCounts: Record<string, number>
@@ -67,21 +87,27 @@ export async function importOsm(
   }
 
   const createClient = deps?.createArangoClient ?? createArangoClientLive
-  const dbClient = await createClient({
-    url: conn.url,
-    database: conn.database,
-    username: conn.username,
-    password: conn.password,
-  })
+  let dbClient: Awaited<ReturnType<typeof createArangoClientLive>> | null = null
 
-  const info = await dbClient.getCollectionInfo(opts.collection)
-  if (!info) {
-    throw new Error(`Collection not found: ${opts.collection}. Run: osm2arango bootstrap`)
+  if (!opts.dryRun) {
+    dbClient = await createClient({
+      url: conn.url,
+      database: conn.database,
+      username: conn.username,
+      password: conn.password,
+      ...(opts.importTransport ? { importTransport: opts.importTransport } : {}),
+    })
+
+    const info = await dbClient.getCollectionInfo(opts.collection)
+    if (!info) {
+      throw new Error(`Collection not found: ${opts.collection}. Run: osm2arango bootstrap`)
+    }
   }
 
   const importer = createDocumentChunker<OsmFeatureDoc>(opts.chunkBytes)
   const inFlight = new Set<Promise<void>>()
   const unsupportedGeometryMode = opts.unsupportedGeometry ?? 'skip'
+  const profile = opts.profile ?? 'all'
 
   const now = deps?.now ?? Date.now
   const progressIntervalMs = deps?.progressIntervalMs ?? 1000
@@ -94,6 +120,11 @@ export async function importOsm(
   let empty = 0
   let errors = 0
   let skippedUnsupportedGeometry = 0
+  let skippedByProfile = 0
+  let skippedTooLongLines = 0
+  let skippedInvalidJsonLines = 0
+  let maxTooLongLineBytes = 0
+  let maxInvalidJsonLineBytes = 0
 
   const geometryTypeCounts: Record<string, number> = {}
   const unsupportedGeometryTypeCounts: Record<string, number> = {}
@@ -109,6 +140,7 @@ export async function importOsm(
     deps.onProgress({
       phase,
       adapter: opts.adapter,
+      profile,
       seen,
       created,
       updated,
@@ -116,12 +148,18 @@ export async function importOsm(
       empty,
       errors,
       skippedUnsupportedGeometry,
+      skippedByProfile,
+      skippedTooLongLines,
+      skippedInvalidJsonLines,
       inFlight: inFlight.size,
       unsupportedGeometryMode,
     })
   }
 
   const enqueueChunk = async (chunk: OsmFeatureDoc[]): Promise<void> => {
+    if (opts.dryRun || !dbClient)
+      return
+
     const p = dbClient
       .importDocuments(opts.collection, chunk, { onDuplicate: opts.onDuplicate })
       .then((res) => {
@@ -142,19 +180,24 @@ export async function importOsm(
     }
   }
 
-  const pushDoc = async (doc: OsmFeatureDoc): Promise<void> => {
-    const chunk = importer.push(doc)
+  const pushDoc = async (doc: OsmFeatureDoc, estimatedBytes: number): Promise<void> => {
+    const chunk = importer.push(doc, estimatedBytes)
     if (chunk)
       await enqueueChunk(chunk)
   }
 
   const trackAndMaybeSkip = (doc: OsmFeatureDoc): boolean => {
-    // Keep input robust; NDJSON adapter allows "passthrough" documents.
     const rawType = (doc.geometry as { type?: unknown }).type
     const geometryType = typeof rawType === 'string' && rawType.length > 0 ? rawType : 'unknown'
 
     seen++
     geometryTypeCounts[geometryType] = (geometryTypeCounts[geometryType] ?? 0) + 1
+
+    if (!shouldImportFeatureForProfile(doc, profile)) {
+      skippedByProfile++
+      reportProgress('reading', false)
+      return true
+    }
 
     if (isArangoSupportedGeoJsonGeometryType(geometryType))
       return false
@@ -171,7 +214,6 @@ export async function importOsm(
       )
     }
 
-    // skip
     skippedUnsupportedGeometry++
     reportProgress('reading', false)
     return true
@@ -179,24 +221,59 @@ export async function importOsm(
 
   reportProgress('reading', true)
 
+  const readLinesOptsBase = {
+    tooLongLine: 'skip' as const,
+    onTooLongLine: ({ bytes }: { bytes: number }) => {
+      skippedTooLongLines++
+      maxTooLongLineBytes = Math.max(maxTooLongLineBytes, bytes)
+      reportProgress('reading', false)
+    },
+  }
+
+  const readLinesOpts = opts.maxLineBytes !== undefined
+    ? { maxLineBytes: opts.maxLineBytes, ...readLinesOptsBase }
+    : readLinesOptsBase
+
+  const invalidJsonMode = opts.invalidJson ?? 'error'
+
   if (opts.adapter === 'ndjson') {
     const stream = inputFile.stream()
-    for await (const line0 of readLines(stream)) {
+    let record = 0
+    for await (const line0 of readLines(stream, readLinesOpts)) {
+      record++
       const line = stripRecordSeparator(line0).trim()
       if (!line)
         continue
-      const parsed = JSON.parse(line) as unknown
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(line) as unknown
+      }
+      catch (err) {
+        if (invalidJsonMode === 'skip') {
+          skippedInvalidJsonLines++
+          maxInvalidJsonLineBytes = Math.max(maxInvalidJsonLineBytes, line.length)
+          reportProgress('reading', false)
+          continue
+        }
+        throw new Error(
+          `Invalid JSON in NDJSON input at record ${record}: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
       const doc = normalizeInputToDoc(parsed)
       if (trackAndMaybeSkip(doc))
         continue
       reportProgress('reading', false)
-      await pushDoc(doc)
+      // Estimate chunk size from the input line to avoid extra JSON.stringify.
+      await pushDoc(doc, line.length + 1)
     }
   }
   else if (opts.adapter === 'osmium-geojsonseq') {
     let proc: Bun.Subprocess
     try {
-      proc = spawnOsmiumExport(inputPath)
+      proc = spawnOsmiumExport(inputPath, {
+        ...(opts.osmiumIndexType ? { indexType: opts.osmiumIndexType } : {}),
+        ...(opts.osmiumGeometryTypes ? { geometryTypes: opts.osmiumGeometryTypes } : {}),
+      })
     }
     catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -215,20 +292,54 @@ export async function importOsm(
       throw new TypeError('Failed to spawn osmium (stdout is not a stream).')
     }
 
-    for await (const line0 of readLines(proc.stdout)) {
+    let record = 0
+    const osmiumReadLinesOpts = {
+      ...readLinesOpts,
+      flushFinalPartialLine: false,
+      onFinalPartialLine: ({ bytes }: { bytes: number }) => {
+        // If osmium crashes / gets killed, stdout can end mid-record. Avoid trying to parse it.
+        skippedInvalidJsonLines++
+        maxInvalidJsonLineBytes = Math.max(maxInvalidJsonLineBytes, bytes)
+        reportProgress('reading', false)
+      },
+    }
+
+    for await (const line0 of readLines(proc.stdout, osmiumReadLinesOpts)) {
+      record++
       const line = stripRecordSeparator(line0).trim()
       if (!line)
         continue
-      const parsed = JSON.parse(line) as unknown
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(line) as unknown
+      }
+      catch (err) {
+        if (invalidJsonMode === 'skip') {
+          skippedInvalidJsonLines++
+          maxInvalidJsonLineBytes = Math.max(maxInvalidJsonLineBytes, line.length)
+          reportProgress('reading', false)
+          continue
+        }
+        throw new Error(
+          `Invalid JSON from osmium at record ${record}: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
       const doc = osmiumGeoJsonFeatureToDoc(parsed)
       if (trackAndMaybeSkip(doc))
         continue
       reportProgress('reading', false)
-      await pushDoc(doc)
+      await pushDoc(doc, line.length + 1)
     }
 
     const exitCode = await proc.exited
     if (exitCode !== 0) {
+      if (exitCode === 137) {
+        throw new Error(
+          'osmium export failed with exit code 137 (killed by SIGKILL; likely out-of-memory). '
+          + 'Try increasing Docker memory limits and/or use a file-based osmium location index, e.g.: '
+          + '`--osmium-index-type sparse_file_array,/tmp/osmium.node.locations`.',
+        )
+      }
       throw new Error(`osmium export failed with exit code ${exitCode}`)
     }
   }
@@ -244,12 +355,13 @@ export async function importOsm(
   await Promise.all(inFlight)
   reportProgress('done', true)
 
-  // Minimal reporting for now; callers can wrap this.
+  // Treat server-side import errors as fatal.
   if (errors > 0) {
     throw new Error(`Import finished with errors: ${errors} (created: ${created}, updated: ${updated})`)
   }
 
   return {
+    profile,
     seen,
     created,
     updated,
@@ -257,6 +369,11 @@ export async function importOsm(
     empty,
     errors,
     skippedUnsupportedGeometry,
+    skippedByProfile,
+    skippedTooLongLines,
+    skippedInvalidJsonLines,
+    maxInvalidJsonLineBytes,
+    maxTooLongLineBytes,
     unsupportedGeometryMode,
     geometryTypeCounts,
     unsupportedGeometryTypeCounts,

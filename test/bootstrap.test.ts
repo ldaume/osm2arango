@@ -38,4 +38,33 @@ describe('bootstrapArango()', () => {
     expect(calls).toContain('ensurePersistentIndex:osm:osm_features:tagsKeys[*]:true:tagsKeys_arr')
     expect(calls).toContain('ensurePersistentIndex:osm:osm_features:tagsKV[*]:true:tagsKV_arr')
   })
+
+  test('can skip index creation', async () => {
+    // Given
+    const calls: string[] = []
+
+    const createArangoClient = async ({ database }: { database: string }) => {
+      calls.push(`createClient:${database}`)
+      return {
+        ensureDatabase: async (name: string) => calls.push(`ensureDatabase:${database}:${name}`),
+        ensureCollection: async (name: string) => calls.push(`ensureCollection:${database}:${name}`),
+        getCollectionInfo: async () => null,
+        ensureGeoIndex: async (collection: string) => calls.push(`ensureGeoIndex:${database}:${collection}`),
+        ensurePersistentIndex: async (collection: string) => calls.push(`ensurePersistentIndex:${database}:${collection}`),
+        importDocuments: async () => ({ created: 0, errors: 0 }),
+      }
+    }
+
+    // When
+    await bootstrapArango(
+      { url: 'http://127.0.0.1:8529', database: 'osm', username: 'root', password: 'pw' },
+      { collection: 'osm_features', indexes: 'none' },
+      { createArangoClient: createArangoClient as any },
+    )
+
+    // Then
+    expect(calls).toContain('ensureCollection:osm:osm_features')
+    expect(calls.some(c => c.startsWith('ensureGeoIndex:'))).toBe(false)
+    expect(calls.some(c => c.startsWith('ensurePersistentIndex:'))).toBe(false)
+  })
 })

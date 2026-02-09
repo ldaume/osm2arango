@@ -9,6 +9,21 @@ services:
       - arango_data:/var/lib/arangodb3
       - arango_apps:/var/lib/arangodb3-apps
 
+  importer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - arangodb
+    environment:
+      # Container-to-container connection (do not use 127.0.0.1 here).
+      ARANGO_URL: http://arangodb:8529
+      ARANGO_DB: ${ARANGO_DB:-osm}
+      ARANGO_USER: ${ARANGO_USER:-root}
+      ARANGO_PASS: ${ARANGO_PASS:-changeme}
+    volumes:
+      - ./data:/app/data
+
 volumes:
   arango_data:
   arango_apps:

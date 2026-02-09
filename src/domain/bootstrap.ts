@@ -3,6 +3,7 @@ import { createArangoClient as createArangoClientLive } from '../arango/arango.d
 
 export interface BootstrapOptions {
   collection: string
+  indexes?: 'all' | 'none' | 'geo' | 'tags'
 }
 
 export interface BootstrapDeps {
@@ -16,7 +17,7 @@ export async function bootstrapArango(
 ): Promise<void> {
   const createClient = deps?.createArangoClient ?? createArangoClientLive
 
-  // System DB is needed for database creation.
+  // Databases can only be created via _system.
   const systemClient = await createClient({
     url: conn.url,
     database: '_system',
@@ -34,11 +35,18 @@ export async function bootstrapArango(
 
   await dbClient.ensureCollection(opts.collection)
 
-  // GeoJSON geo index for geometry. This is the critical index for later aggregation workloads.
-  // Note: for index-backed AQL filters with GEO_* utility functions, pass `doc.geometry` as the 2nd argument.
-  await dbClient.ensureGeoIndex(opts.collection, ['geometry'], true, 'geometry_geo')
+  const indexes = opts.indexes ?? 'all'
+  if (indexes === 'none')
+    return
 
-  // Tag lookup: array indexes for (key) and (key=value). Keeps tag schema stable.
-  await dbClient.ensurePersistentIndex(opts.collection, ['tagsKeys[*]'], true, 'tagsKeys_arr')
-  await dbClient.ensurePersistentIndex(opts.collection, ['tagsKV[*]'], true, 'tagsKV_arr')
+  if (indexes === 'geo' || indexes === 'all') {
+    // GeoJSON index on `geometry` for GEO_* utility functions.
+    await dbClient.ensureGeoIndex(opts.collection, ['geometry'], true, 'geometry_geo')
+  }
+
+  if (indexes === 'tags' || indexes === 'all') {
+    // Array indexes for tag lookups by key and key=value.
+    await dbClient.ensurePersistentIndex(opts.collection, ['tagsKeys[*]'], true, 'tagsKeys_arr')
+    await dbClient.ensurePersistentIndex(opts.collection, ['tagsKV[*]'], true, 'tagsKV_arr')
+  }
 }

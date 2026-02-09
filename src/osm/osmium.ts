@@ -3,26 +3,54 @@ import { assertRecord, isRecord } from '../util/guards.ts'
 
 export interface OsmiumAdapterOptions {
   osmiumPath?: string
+  /**
+   * See `osmium export --help` / `man osmium-export`:
+   * `--index-type` controls the node-location index (memory vs file based).
+   * This can be critical for large extracts (e.g. germany/planet) to avoid OOM kills.
+   */
+  indexType?: string
+  /**
+   * Comma-separated list for `osmium export --geometry-types`, e.g. "point,polygon".
+   * Useful to drop noisy geometries early (e.g. roads as LineStrings).
+   */
+  geometryTypes?: string
+  /**
+   * Path to an osmium export config JSON (`--config`).
+   * Useful for include/exclude tag filtering to reduce output volume.
+   */
+  configPath?: string
 }
 
-export function buildOsmiumExportArgs(inputPath: string): string[] {
-  return [
+export function buildOsmiumExportArgs(inputPath: string, opts?: OsmiumAdapterOptions): string[] {
+  const args = [
     'export',
     inputPath,
     '-f',
     'geojsonseq',
     '-x',
     'print_record_separator=false',
-    '-x',
-    'tags_type=array',
     '--add-unique-id=type_id',
     '--attributes=type,id,version,changeset,timestamp,uid,user',
   ]
+
+  if (opts?.indexType) {
+    args.push('--index-type', opts.indexType)
+  }
+
+  if (opts?.geometryTypes) {
+    args.push('--geometry-types', opts.geometryTypes)
+  }
+
+  if (opts?.configPath) {
+    args.push('--config', opts.configPath)
+  }
+
+  return args
 }
 
 export function spawnOsmiumExport(inputPath: string, opts?: OsmiumAdapterOptions): Bun.Subprocess {
   const cmd = opts?.osmiumPath ?? 'osmium'
-  const args = buildOsmiumExportArgs(inputPath)
+  const args = buildOsmiumExportArgs(inputPath, opts)
 
   return Bun.spawn([cmd, ...args], {
     stdin: 'ignore',
@@ -52,20 +80,41 @@ export function osmiumGeoJsonFeatureToDoc(feature: unknown): OsmFeatureDoc {
   const tagsKV = tagsKeys.map(k => `${k}=${tags[k]}`)
 
   const osm: OsmFeatureDoc['osm'] = {}
-  if (typeof properties.type === 'string')
-    osm.type = properties.type
-  if (typeof properties.id === 'number')
-    osm.id = properties.id
-  if (typeof properties.version === 'number')
-    osm.version = properties.version
-  if (typeof properties.changeset === 'number')
-    osm.changeset = properties.changeset
-  if (typeof properties.timestamp === 'string')
-    osm.timestamp = properties.timestamp
-  if (typeof properties.uid === 'number')
-    osm.uid = properties.uid
-  if (typeof properties.user === 'string')
-    osm.user = properties.user
+  const p = properties as Record<string, unknown>
+  if (typeof p['@type'] === 'string')
+    osm.type = p['@type']
+  else if (typeof p.type === 'string')
+    osm.type = p.type
+
+  if (typeof p['@id'] === 'number')
+    osm.id = p['@id']
+  else if (typeof p.id === 'number')
+    osm.id = p.id
+
+  if (typeof p['@version'] === 'number')
+    osm.version = p['@version']
+  else if (typeof p.version === 'number')
+    osm.version = p.version
+
+  if (typeof p['@changeset'] === 'number')
+    osm.changeset = p['@changeset']
+  else if (typeof p.changeset === 'number')
+    osm.changeset = p.changeset
+
+  if (typeof p['@timestamp'] === 'number')
+    osm.timestamp = p['@timestamp']
+  else if (typeof p.timestamp === 'number')
+    osm.timestamp = p.timestamp
+
+  if (typeof p['@uid'] === 'number')
+    osm.uid = p['@uid']
+  else if (typeof p.uid === 'number')
+    osm.uid = p.uid
+
+  if (typeof p['@user'] === 'string')
+    osm.user = p['@user']
+  else if (typeof p.user === 'string')
+    osm.user = p.user
 
   return {
     _key: sanitizeArangoKey(key),
@@ -78,14 +127,24 @@ export function osmiumGeoJsonFeatureToDoc(feature: unknown): OsmFeatureDoc {
 }
 
 function deriveFallbackKey(properties: Record<string, unknown>): string {
-  const t = typeof properties.type === 'string' ? properties.type : 'x'
-  const id = typeof properties.id === 'number' ? String(properties.id) : '0'
+  const t = typeof properties['@type'] === 'string'
+    ? properties['@type']
+    : typeof properties.type === 'string'
+      ? properties.type
+      : 'x'
+
+  const id = typeof properties['@id'] === 'number'
+    ? String(properties['@id'])
+    : typeof properties.id === 'number'
+      ? String(properties.id)
+      : '0'
+
   const prefix = t.length > 0 ? t[0] : 'x'
   return `${prefix}${id}`
 }
 
 function sanitizeArangoKey(key: string): string {
-  // ArangoDB _key constraints are strict; keep it conservative for now.
+  // Sanitize for ArangoDB _key constraints.
   return key.replace(/[^\w:\-.]/g, '_')
 }
 
@@ -99,7 +158,13 @@ function normalizeTags(properties: Record<string, unknown>): Record<string, stri
       if (!isRecord(t))
         continue
       const k = typeof t.k === 'string' ? t.k : typeof t.key === 'string' ? t.key : undefined
-      const v = typeof t.v === 'string' ? t.v : typeof t.value === 'string' ? t.value : undefined
+      const v0 = t.v ?? t.value
+      const v
+        = typeof v0 === 'string'
+          ? v0
+          : typeof v0 === 'number' || typeof v0 === 'boolean'
+            ? String(v0)
+            : undefined
       if (!k || v === undefined)
         continue
       tags[k] = v
@@ -116,6 +181,13 @@ function normalizeTags(properties: Record<string, unknown>): Record<string, stri
     'timestamp',
     'uid',
     'user',
+    '@type',
+    '@id',
+    '@version',
+    '@changeset',
+    '@timestamp',
+    '@uid',
+    '@user',
     'tags',
   ])
 
@@ -124,6 +196,8 @@ function normalizeTags(properties: Record<string, unknown>): Record<string, stri
       continue
     if (typeof v === 'string')
       tags[k] = v
+    else if (typeof v === 'number' || typeof v === 'boolean')
+      tags[k] = String(v)
   }
 
   return tags

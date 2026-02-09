@@ -45,7 +45,7 @@ If you cannot (or do not want to) install `osmium`, convert your extract to `.nd
 0. Start ArangoDB (optional):
 
 ```bash
-docker-compose up
+docker compose up -d arangodb
 ```
 
 0. Install dependencies:
@@ -88,6 +88,14 @@ export ARANGO_PASS="your-password"
 bun run bin/osm2arango bootstrap
 ```
 
+For very large imports (e.g. `germany-latest.osm.pbf`), consider bootstrapping **without** secondary indexes first to reduce memory/CPU overhead during ingest, then create indexes afterward:
+
+```bash
+bun run bin/osm2arango bootstrap --indexes none
+# import ...
+bun run bin/osm2arango bootstrap # (default: --indexes all)
+```
+
 3. Download an extract from Geofabrik:
 
 ```bash
@@ -100,6 +108,15 @@ bun run bin/osm2arango download europe/germany/berlin
 bun run bin/osm2arango import data/berlin-latest.osm.pbf
 ```
 
+Large extracts: `osmium export` needs a node-location index to build geometries. The default index type may use a lot of RAM; if you see `osmium export failed with exit code 137` (killed; likely OOM), try a file-based index type:
+
+```bash
+bun run bin/osm2arango import data/germany-latest.osm.pbf \
+  --osmium-index-type sparse_file_array,/tmp/osmium.node.locations
+```
+
+By default, `import` uses `--profile places` (amenities + recreation like forests/water/green areas) and will also default to `--osmium-geometry-types point,polygon` to avoid importing roads as LineStrings. Use `--profile all` to import everything.
+
 Alternative: Import an `.ndjson` file (NDJSON = newline-delimited JSON) that contains one GeoJSON Feature per line:
 
 ```bash
@@ -107,6 +124,60 @@ bun run bin/osm2arango import data/berlin.ndjson --adapter=ndjson
 ```
 
 Note: progress and status messages are printed to `stderr` so `stdout` can be piped.
+
+## Wizard (Interactive)
+
+If you prefer a guided flow that mirrors Geofabrik’s region tree (continent -> country -> ...), use the interactive wizard:
+
+```bash
+bun run bin/osm2arango wizard
+```
+
+Navigation: use Up/Down + Enter, and start typing to filter long lists.
+
+The wizard can import a single extract (e.g. `europe/germany`) or split by direct children (e.g. Germany -> Bundeslaender) to avoid massive one-shot imports.
+
+Power-user flags:
+
+```bash
+# Print the plan only (no downloads/import/writes)
+bun run bin/osm2arango wizard --plan
+
+# Preselect region + scope (region/children/leaves)
+bun run bin/osm2arango wizard --region europe/germany/berlin --scope region
+```
+
+Docker (recommended on macOS for very large imports):
+
+```bash
+docker compose up -d arangodb
+docker compose build importer
+docker compose run --rm importer wizard
+```
+
+## Import Profiles
+
+The import can be scoped to a smaller, more “place scoring” oriented dataset using `--profile`:
+
+- `places` (default): `amenity=*` plus recreation/nature/green features
+- `amenities`: only `amenity=*`
+- `recreation`: leisure/nature/green features
+- `all`: everything `osmium export` produces
+
+Profiles decide **which features** to import, but do **not** strip tags: all OSM tags for an imported feature are preserved.
+
+Current `places/recreation` matching logic (subject to change as we learn):
+
+- `leisure=*`
+- `waterway=*`
+- `natural` in: `wood`, `water`, `wetland`, `beach`, `grassland`, `heath`, `scrub`
+- `landuse` in: `forest`, `meadow`, `grass`, `recreation_ground`, `village_green`, `allotments`
+- `boundary` in: `national_park`, `protected_area`
+
+You can also control geometry volume early via osmium (only relevant for `.osm.pbf`):
+
+- default for non-`all` profiles: `--osmium-geometry-types point,polygon` (drops most roads as LineStrings)
+- for full fidelity: `--osmium-geometry-types point,linestring,polygon`
 
 ## Data Model (v0)
 

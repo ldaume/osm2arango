@@ -9,4 +9,6 @@ data/
 AGENTS.md
 CLAUDE.md
 .cursor/
-.vscode/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

@@ -1,6 +1,9 @@
+import type { ImportProgress } from './domain/import.ts'
+
 import { parseArgs } from './cli/args.ts'
 import { formatHelp } from './cli/help.ts'
 import { createCliUi, formatBytes, formatDurationMs, formatNumber } from './cli/ui.ts'
+import { runWizard } from './cli/wizard.ts'
 import {
   readNumberFlagWithDefault,
   readStringFlagWithDefault,
@@ -34,10 +37,14 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
     if (command === 'bootstrap') {
       const conn = resolveArangoConnectionConfig(env, flags)
       const collection = readStringFlagWithDefault(flags, 'collection', 'osm_features')
+      const indexes = readStringFlagWithDefault(flags, 'indexes', 'all')
+      if (!['all', 'none', 'geo', 'tags'].includes(indexes)) {
+        throw new Error(`Invalid --indexes: ${indexes}`)
+      }
       const startedAt = Date.now()
-      ui.info(`Bootstrapping ArangoDB: db=${conn.database} collection=${collection}`)
-      await bootstrapArango(conn, { collection })
-      process.stdout.write(`Bootstrapped ArangoDB: db=${conn.database} collection=${collection}\n`)
+      ui.info(`Bootstrapping ArangoDB: db=${conn.database} collection=${collection} indexes=${indexes}`)
+      await bootstrapArango(conn, { collection, indexes: indexes as 'all' | 'none' | 'geo' | 'tags' })
+      process.stdout.write(`Bootstrapped ArangoDB: db=${conn.database} collection=${collection} indexes=${indexes}\n`)
       process.stdout.write(`Duration: ${formatDurationMs(Date.now() - startedAt)}\n`)
       return
     }
@@ -112,21 +119,51 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
         throw new Error(`Invalid --unsupported-geometry: ${unsupportedGeometry}`)
       }
 
+      const maxLineMb = readNumberFlagWithDefault(flags, 'max-line-mb', 8)
+
+      const importTransportFlag = flags['import-transport']
+      if (importTransportFlag === true)
+        throw new Error('Missing value for --import-transport')
+      const importTransport
+        = typeof importTransportFlag === 'string'
+          ? importTransportFlag
+          : Bun.which('curl')
+            ? 'curl'
+            : 'arangojs'
+      if (!['arangojs', 'node-http', 'curl'].includes(importTransport)) {
+        throw new Error(`Invalid --import-transport: ${importTransport}`)
+      }
+
+      const invalidJson = readStringFlagWithDefault(flags, 'invalid-json', 'error')
+      if (!['error', 'skip'].includes(invalidJson)) {
+        throw new Error(`Invalid --invalid-json: ${invalidJson}`)
+      }
+
+      const osmiumIndexTypeFlag = flags['osmium-index-type']
+      const osmiumIndexType = typeof osmiumIndexTypeFlag === 'string' ? osmiumIndexTypeFlag : undefined
+
+      const profile = readStringFlagWithDefault(flags, 'profile', 'places')
+      if (!['all', 'places', 'amenities', 'recreation'].includes(profile)) {
+        throw new Error(`Invalid --profile: ${profile}`)
+      }
+
+      const osmiumGeometryTypesFlag = flags['osmium-geometry-types']
+      const osmiumGeometryTypesRaw = typeof osmiumGeometryTypesFlag === 'string' ? osmiumGeometryTypesFlag : undefined
+      // Sensible default: drop LineStrings for place scoring use-cases.
+      const osmiumGeometryTypes = osmiumGeometryTypesRaw ?? (profile === 'all' ? undefined : 'point,polygon')
+
+      const dryRun = flags['dry-run'] === true
+      const noProgress = flags['no-progress'] === true
+
       ui.info(
         `Importing ${input} into ${conn.database}.${collection} `
-        + `(adapter=${adapter} chunkMb=${chunkMb} concurrency=${concurrency} onDuplicate=${onDuplicate} unsupportedGeometry=${unsupportedGeometry})`,
+        + `(adapter=${adapter} profile=${profile} chunkMb=${chunkMb} maxLineMb=${maxLineMb} concurrency=${concurrency} onDuplicate=${onDuplicate} unsupportedGeometry=${unsupportedGeometry} importTransport=${importTransport} invalidJson=${invalidJson}${osmiumIndexType ? ` osmiumIndexType=${osmiumIndexType}` : ''}${osmiumGeometryTypes ? ` osmiumGeometryTypes=${osmiumGeometryTypes}` : ''}${dryRun ? ' dryRun=true' : ''})`,
       )
       const startedAt = Date.now()
 
-      const summary = await importOsm(conn, input, {
-        collection,
-        adapter,
-        chunkBytes: chunkMb * 1024 * 1024,
-        concurrency,
-        onDuplicate: onDuplicate as 'error' | 'update' | 'replace' | 'ignore',
-        unsupportedGeometry: unsupportedGeometry as 'skip' | 'keep' | 'error',
-      }, {
-        onProgress: (p) => {
+      const importDeps: { onProgress?: (p: ImportProgress) => void } = {}
+      if (!noProgress) {
+        importDeps.onProgress = (p) => {
           const elapsedMs = Date.now() - startedAt
           const elapsedSec = elapsedMs > 0 ? elapsedMs / 1000 : 0
           const rate = elapsedSec > 0 ? p.seen / elapsedSec : 0
@@ -134,19 +171,40 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 
           ui.progress(
             `Import ${p.phase}: `
+            + `profile=${p.profile} `
             + `seen=${formatNumber(p.seen)} `
             + `created=${formatNumber(p.created)} `
             + `updated=${formatNumber(p.updated)} `
-            + `skipped=${formatNumber(p.skippedUnsupportedGeometry)} `
+            + `skippedGeom=${formatNumber(p.skippedUnsupportedGeometry)} `
+            + `skippedProf=${formatNumber(p.skippedByProfile)} `
+            + `skippedLong=${formatNumber(p.skippedTooLongLines)} `
+            + `skippedJson=${formatNumber(p.skippedInvalidJsonLines)} `
             + `errors=${formatNumber(p.errors)} `
             + `inFlight=${formatNumber(p.inFlight)} `
             + `rate=${rateStr}`,
           )
-        },
-      })
+        }
+      }
+
+      const summary = await importOsm(conn, input, {
+        collection,
+        adapter,
+        chunkBytes: chunkMb * 1024 * 1024,
+        maxLineBytes: maxLineMb * 1024 * 1024,
+        concurrency,
+        onDuplicate: onDuplicate as 'error' | 'update' | 'replace' | 'ignore',
+        unsupportedGeometry: unsupportedGeometry as 'skip' | 'keep' | 'error',
+        importTransport: importTransport as 'arangojs' | 'node-http' | 'curl',
+        invalidJson: invalidJson as 'error' | 'skip',
+        ...(osmiumIndexType ? { osmiumIndexType } : {}),
+        ...(osmiumGeometryTypes ? { osmiumGeometryTypes } : {}),
+        profile: profile as 'all' | 'places' | 'amenities' | 'recreation',
+        dryRun,
+      }, importDeps)
       ui.progressDone()
 
-      process.stdout.write(`Imported into ${conn.database}.${collection}\n`)
+      process.stdout.write(`${dryRun ? 'Dry run completed' : 'Imported'} into ${conn.database}.${collection}\n`)
+      process.stdout.write(`Profile: ${summary.profile}\n`)
       process.stdout.write(`Seen: ${summary.seen}\n`)
       process.stdout.write(`Created: ${summary.created} Updated: ${summary.updated} Ignored: ${summary.ignored} Empty: ${summary.empty} Errors: ${summary.errors}\n`)
 
@@ -165,12 +223,30 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
         process.stdout.write(formatGeometryCounts('Unsupported geometry types', summary.unsupportedGeometryTypeCounts))
       }
 
+      if (summary.skippedTooLongLines > 0) {
+        const largest = summary.maxTooLongLineBytes > 0 ? `, largest=${formatBytes(summary.maxTooLongLineBytes)}` : ''
+        process.stdout.write(`Skipped too-long lines: ${summary.skippedTooLongLines}${largest}\n`)
+      }
+
+      if (summary.skippedByProfile > 0) {
+        process.stdout.write(`Skipped by profile: ${summary.skippedByProfile}\n`)
+      }
+
+      if (summary.skippedInvalidJsonLines > 0) {
+        const largest = summary.maxInvalidJsonLineBytes > 0 ? `, largest~=${formatBytes(summary.maxInvalidJsonLineBytes)}` : ''
+        process.stdout.write(`Skipped invalid JSON lines: ${summary.skippedInvalidJsonLines}${largest}\n`)
+      }
+
       process.stdout.write(`Duration: ${formatDurationMs(Date.now() - startedAt)}\n`)
       return
     }
 
+    if (command === 'wizard') {
+      await runWizard(env, flags, ui)
+      return
+    }
+
     if (command === 'geofabrik-url') {
-      // Small helper for scripts.
       const regionOrUrl = positionals[1]
       if (!regionOrUrl)
         throw new Error('Missing argument: <region|url>')

@@ -63,3 +63,22 @@ updates:
         versions:
           - 3.13.*
           - 4.*
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(docker)
+      include: scope
+    groups:
+      docker-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+        patterns:
+          - '*'

@@ -12,7 +12,10 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "build": "bun build src/cli.ts --outdir dist --target bun"
+    "build": "bun build src/cli.ts --outdir dist --target bun",
+    "import:docker": "docker compose up -d arangodb && docker compose build importer && docker compose run --rm importer import",
+    "wizard:local": "bun run bin/osm2arango wizard",
+    "wizard:docker": "docker compose up -d arangodb && docker compose build importer && docker compose run --rm importer wizard"
   },
   "dependencies": {
     "arangojs": "^10.2.2"

@@ -9,7 +9,10 @@ export interface OsmCore {
   id?: number
   version?: number
   changeset?: number
-  timestamp?: string
+  /**
+   * Unix timestamp (seconds since epoch). From osmium export: `@timestamp`.
+   */
+  timestamp?: number
   uid?: number
   user?: string
 }

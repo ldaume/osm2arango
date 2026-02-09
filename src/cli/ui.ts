@@ -31,7 +31,7 @@ export function createCliUi(stream: WritableTextStream = process.stderr): CliUi 
   }
 
   const nextSpinner = (): string => {
-    // ASCII-only spinner. Keep stable and predictable.
+    // ASCII-only spinner frames (avoid Unicode for broad terminal compatibility).
     const frames = ['-', '\\', '|', '/'] as const
     const frame = frames[spinnerIdx % frames.length] ?? '-'
     spinnerIdx++

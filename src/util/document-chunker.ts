@@ -1,5 +1,5 @@
 export interface DocumentChunker<T> {
-  push: (doc: T) => T[] | undefined
+  push: (doc: T, estimatedBytes?: number) => T[] | undefined
   flush: () => T[] | undefined
 }
 
@@ -20,10 +20,12 @@ export function createDocumentChunker<T>(maxBytes: number): DocumentChunker<T> {
     return chunk
   }
 
-  const push = (doc: T): T[] | undefined => {
-    // We chunk by approximate payload size. The actual request overhead is a bit higher
-    // (JSON array delimiters, commas), but this keeps memory bounded deterministically.
-    const docBytes = Buffer.byteLength(JSON.stringify(doc), 'utf8') + 1
+  const push = (doc: T, estimatedBytes?: number): T[] | undefined => {
+    // Chunk by approximate payload size to keep memory bounded.
+    // Callers can pass an estimate (e.g. NDJSON line length) to avoid extra JSON.stringify.
+    const docBytes = typeof estimatedBytes === 'number' && Number.isFinite(estimatedBytes) && estimatedBytes > 0
+      ? estimatedBytes
+      : Buffer.byteLength(JSON.stringify(doc), 'utf8') + 1
 
     if (docs.length > 0 && bytes + docBytes > maxBytes) {
       const chunk = flush()

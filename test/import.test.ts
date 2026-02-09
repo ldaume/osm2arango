@@ -188,6 +188,96 @@ describe('importOsm()', () => {
       await cleanup()
     }
   })
+
+  test('skips too-long NDJSON lines before parsing', async () => {
+    // Given
+    const { inputPath, cleanup } = await writeNdjson([
+      geojsonFeaturePointWithHugeTag('n1', 5_000),
+      geojsonFeaturePoint('n2'),
+    ])
+
+    const importedDocs: object[] = []
+    const arangoClient = createStubArangoClient({
+      importDocuments: async (_collection, docs) => {
+        importedDocs.push(...docs)
+        return { created: docs.length, updated: 0, ignored: 0, empty: 0, errors: 0 }
+      },
+    })
+
+    try {
+      // When
+      const summary = await importOsm(
+        { url: 'http://127.0.0.1:8529', database: 'osm', username: 'root', password: 'pw' },
+        inputPath,
+        {
+          collection: 'osm_features',
+          adapter: 'ndjson',
+          chunkBytes: 1024 * 1024,
+          maxLineBytes: 200,
+          concurrency: 1,
+          onDuplicate: 'update',
+        },
+        {
+          createArangoClient: async () => arangoClient,
+        },
+      )
+
+      // Then
+      expect(summary.seen).toBe(1)
+      expect(summary.created).toBe(1)
+      expect(summary.skippedTooLongLines).toBe(1)
+      expect(summary.maxTooLongLineBytes > 0).toBe(true)
+      expect(importedDocs).toHaveLength(1)
+    }
+    finally {
+      await cleanup()
+    }
+  })
+
+  test('can filter imported features by profile', async () => {
+    // Given
+    const { inputPath, cleanup } = await writeNdjson([
+      geojsonFeaturePoint('n1'), // amenity=cafe
+      geojsonFeatureNaturalWood('w1'),
+    ])
+
+    const importedDocs: object[] = []
+    const arangoClient = createStubArangoClient({
+      importDocuments: async (_collection, docs) => {
+        importedDocs.push(...docs)
+        return { created: docs.length, updated: 0, ignored: 0, empty: 0, errors: 0 }
+      },
+    })
+
+    try {
+      // When
+      const summary = await importOsm(
+        { url: 'http://127.0.0.1:8529', database: 'osm', username: 'root', password: 'pw' },
+        inputPath,
+        {
+          collection: 'osm_features',
+          adapter: 'ndjson',
+          chunkBytes: 1024 * 1024,
+          concurrency: 1,
+          onDuplicate: 'update',
+          profile: 'amenities',
+        },
+        {
+          createArangoClient: async () => arangoClient,
+        },
+      )
+
+      // Then
+      expect(summary.profile).toBe('amenities')
+      expect(summary.seen).toBe(2)
+      expect(summary.created).toBe(1)
+      expect(summary.skippedByProfile).toBe(1)
+      expect(importedDocs).toHaveLength(1)
+    }
+    finally {
+      await cleanup()
+    }
+  })
 })
 
 function createStubArangoClient(overrides: Partial<ArangoClient>): ArangoClient {
@@ -228,6 +318,35 @@ function geojsonFeatureGeometryCollection(id: string): unknown {
     id,
     properties: { type: 'relation', id: 1, tags: [{ k: 'amenity', v: 'school' }] },
     geometry: { type: 'GeometryCollection', geometries: [] },
+  }
+}
+
+function geojsonFeaturePointWithHugeTag(id: string, bytes: number): unknown {
+  return {
+    type: 'Feature',
+    id,
+    properties: { type: 'node', id: 1, tags: [{ k: 'name', v: 'x'.repeat(bytes) }] },
+    geometry: { type: 'Point', coordinates: [13.4, 52.5] },
+  }
+}
+
+function geojsonFeatureNaturalWood(id: string): unknown {
+  return {
+    type: 'Feature',
+    id,
+    properties: { type: 'way', id: 2, tags: [{ k: 'natural', v: 'wood' }] },
+    geometry: {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [13.0, 52.0],
+          [13.0, 52.1],
+          [13.1, 52.1],
+          [13.1, 52.0],
+          [13.0, 52.0],
+        ],
+      ],
+    },
   }
 }
 

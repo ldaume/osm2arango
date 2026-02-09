@@ -1,5 +1,5 @@
 import type { FetchLike } from '../util/fetch.ts'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, rename, rm } from 'node:fs/promises'
 
 export interface DownloadOptions {
   baseUrl: string
@@ -31,6 +31,7 @@ export async function downloadGeofabrikExtract(
   const url = resolveGeofabrikUrl(regionOrUrl, opts.baseUrl)
   const fileName = url.split('/').pop() ?? 'extract.osm.pbf'
   const path = `${opts.outDir.replace(/\/+$/, '')}/${fileName}`
+  const tmpPath = `${path}.partial.${process.pid}.${Date.now()}`
 
   await mkdir(opts.outDir, { recursive: true })
 
@@ -57,13 +58,20 @@ export async function downloadGeofabrikExtract(
   }
 
   if (!res.body) {
-    await Bun.write(path, res)
+    try {
+      await Bun.write(tmpPath, res)
+      await replaceFile(tmpPath, path)
+    }
+    catch (err) {
+      await rm(tmpPath, { force: true }).catch(() => {})
+      throw err
+    }
     downloadedBytes = res.headers.has('content-length') ? (totalBytes ?? 0) : 0
     reportProgress(true)
     return { url, path }
   }
 
-  const sink = Bun.file(path).writer({ highWaterMark: 1024 * 1024 })
+  const sink = Bun.file(tmpPath).writer({ highWaterMark: 1024 * 1024 })
   try {
     for await (const chunk of res.body) {
       downloadedBytes += chunk.byteLength
@@ -85,9 +93,17 @@ export async function downloadGeofabrikExtract(
         await ended
     }
     catch {}
+    await rm(tmpPath, { force: true }).catch(() => {})
     throw err
   }
 
+  try {
+    await replaceFile(tmpPath, path)
+  }
+  catch (err) {
+    await rm(tmpPath, { force: true }).catch(() => {})
+    throw err
+  }
   reportProgress(true)
   return { url, path }
 }
@@ -110,4 +126,16 @@ function parseContentLength(value: string | null): number | undefined {
   if (!Number.isFinite(n) || n <= 0)
     return undefined
   return n
+}
+
+async function replaceFile(from: string, to: string): Promise<void> {
+  try {
+    await rename(from, to)
+    return
+  }
+  catch {}
+
+  // Best effort: Windows can error if the destination exists.
+  await rm(to, { force: true }).catch(() => {})
+  await rename(from, to)
 }
